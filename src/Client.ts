@@ -43,7 +43,7 @@ import type {
 import type {
   ClientOptions, ClientConfig, ClientEvents, PartyConfig, Schema,
   Region, BlurlStream, Language, PartyData,
-  PartySchema, PresenceOnlineType, BRAccountLevelData,
+  PartySchema, PresencePartyData, PresenceOnlineType, BRAccountLevelData,
 } from '../resources/structs';
 
 /**
@@ -576,37 +576,26 @@ class Client extends EventEmitter {
   /* -------------------------------------------------------------------------- */
 
   /**
-   * Sets the clients XMPP status
+   * Sets the clients presence data
    * @param status The status
    * @param onlineType The presence's online type (eg "away")
-   * @param friend A specific friend you want to send this status to
-   * @throws {FriendNotFoundError} The user does not exist or is not friends with the client
    */
-  public setStatus(status?: string, onlineType?: PresenceOnlineType, friend?: string) {
-    let toJID: string | undefined;
-    if (friend) {
-      const resolvedFriend = this.friend.resolve(friend);
-      if (!resolvedFriend) throw new FriendNotFoundError(friend);
-      toJID = `${resolvedFriend.id}@${Endpoints.EPIC_PROD_ENV}`;
-    }
+  public async setStatus(status?: string, onlineType?: PresenceOnlineType) {
+    let partyJoinInfoData!: PresencePartyData;
 
-    // eslint-disable-next-line no-undef-init
-    let partyJoinInfoData: { [key: string]: any } | undefined = undefined;
     if (this.party) {
       const partyPrivacy = this.party.config.privacy;
+
       if (
         partyPrivacy.presencePermission === 'Noone'
         || (partyPrivacy.presencePermission === 'Leader'
           && !this.party.me?.isLeader)
       ) {
         partyJoinInfoData = {
-          isPrivate: true,
+          bIsPrivate: true,
         };
       } else {
         partyJoinInfoData = {
-          sourceId: this.user.self!.displayName,
-          sourceDisplayName: this.user.self!.displayName,
-          sourcePlatform: this.config.platform,
           partyId: this.party.id,
           partyTypeId: 286331153,
           key: 'k',
@@ -619,43 +608,78 @@ class Client extends EventEmitter {
       }
     }
 
-    if (status && !toJID) this.config.defaultStatus = status;
-    if (onlineType && !toJID) this.config.defaultOnlineType = onlineType;
+    // encode the different data types
+    const val = (arg: unknown) => {
+      if (typeof arg === 'string') {
+        return `s${arg}`;
+      }
 
-    const rawStatus = {
-      Status: status || this.config.defaultStatus || (this.party && `Lobby - ${this.party.size} / ${this.party.maxSize}`)
-        || 'Playing Battle Royale',
-      bIsPlaying: false,
-      bIsJoinable: this.party && !this.party.isPrivate && this.party.size !== this.party.maxSize,
-      bHasVoiceSupport: false,
-      SessionId: '',
-      ProductName: 'Fortnite',
-      Properties: {
-        'party.joininfodata.286331153_j': partyJoinInfoData,
-        FortBasicInfo_j: {
-          homeBaseRating: 0,
-        },
-        FortLFG_I: '0',
-        FortPartySize_i: 1,
-        FortSubGame_i: 1,
-        InUnjoinableMatch_b: false,
-        FortGameplayStats_j: {
-          state: '',
-          playlist: 'None',
-          numKills: 0,
-          bFellToDeath: false,
-        },
-      },
+      if (typeof arg === 'boolean') {
+        return `b${arg.toString()}`;
+      }
+
+      if (typeof arg === 'number') {
+        return `i${arg.toString()}`;
+      }
+
+      if (typeof arg === 'object') {
+        return `m${JSON.stringify(arg)}`;
+      }
+
+      return String(arg);
     };
 
-    const rawOnlineType = (onlineType || this.config.defaultOnlineType) === 'online' ? undefined : onlineType || this.config.defaultOnlineType;
+    // returns own presence data per namespace, but we dont care about that
+    await this.http.epicgamesRequest({
+      method: 'PATCH',
+      url: `${Endpoints.EOS_PRESENCE}/v1/${this.config.eosDeploymentId}/${this.user.self!.id}/presence/${this.stomp.connectionId}`,
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      data: {
+        status: onlineType || this.config.defaultOnlineType,
+        activity: {
+          value: status
+            || this.config.defaultStatus
+            || 'Battle Royale',
+        },
+        props: {
+          // custom fortnite props
+          'party.joininfodata.286331153': val(partyJoinInfoData),
+          FortBasicInfo: val({
+            homeBaseRating: 0,
+          }),
+          FortLFG: val(0),
+          FortPartySize: val(this.party?.size ?? 1),
+          FortSubGame: val(1), // Athena
+          IslandCode: val(this.party?.playlist?.linkId?.mnemonic ?? 'experience_br'),
+          IsInZone: val(false),
+          FortGameplayStats: val({
+            state: '',
+            playlist: 'None',
+            numKills: 0,
+            bFellToDeath: false,
+          }),
+          SocialStatus: val({
+            attendingSocialEventIds: [],
+          }),
+          InUnjoinableMatch: val(false),
 
-    return this.xmpp.sendStatus(
-      rawStatus,
-      rawOnlineType as PresenceShow | undefined,
-      toJID,
-    );
-  }
+          // base eos props, these dont get any value transformation
+          EOS_Platform: this.config.platform,
+          EOS_IntegratedPlatform: 'EGS',
+          EOS_OnlinePlatformType: '100',
+          EOS_ProductVersion: '++Fortnite+Release-XX.XX-CL-XXXXXXXX',
+          EOS_ProductName: 'Fortnite',
+          EOS_Session: '{"version":3}',
+          EOS_Lobby: '{"version":3}',
+        },
+        conn: {
+          props: {},
+        },
+      },
+    }, AuthSessionStoreKey.FortniteEOS);
+  };
 
   /**
    * Resets the client's XMPP status and online type
